@@ -1,0 +1,21 @@
+# Artefatos de build do Rust
+/target
+**/*.rs.bk
+
+# Binarios
+*.exe
+*.dll
+*.pdb
+*.ilk
+
+# Logs e temporarios
+*.log
+*.tmp
+*.bak
+
+# Editores
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
