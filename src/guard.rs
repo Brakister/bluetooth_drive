@@ -286,7 +286,19 @@ fn handle_event(ev: &BthEvent, st: &mut GuardStats, state: &mut WatchState) -> b
     state.last_epoch = ev.epoch;
     st.last_event = Some(ev.clone());
     match ev.id {
-        31 | 34 | 18 => {
+        // 18 = "o radio nao consegue guardar chaves de link": e o PRIMEIRO evento
+        // da sequencia de inicializacao (18 -> 34 -> 31). So ele dispara a
+        // verificacao de saude; 34 e 31 sao apenas informativos.
+        18 => {
+            // Janela pos-reparo: o proprio reinicio do radio gera 18/34/31.
+            // Ignorar evita que o vigia "reaja" ao que ele mesmo caused.
+            if let Some(t) = state.ignore_until {
+                if Instant::now() < t {
+                    log("INFO", "reinicializacao ignorada (janela pos-reparo)");
+                    return true;
+                }
+                state.ignore_until = None;
+            }
             st.radio_restarts += 1;
             log(
                 "WARN",
@@ -296,8 +308,8 @@ fn handle_event(ev: &BthEvent, st: &mut GuardStats, state: &mut WatchState) -> b
             std::thread::sleep(Duration::from_secs(4));
             match pnp::radio_healthy() {
                 None => {
-                    let _ = repair("radio nao subiu apos reinicializacao");
-                    st.recoveries += 1;
+                    // O radio nao subiu: aqui reiniciar o devnode resolve.
+                    try_repair(st, state, "radio nao subiu apos reinicializacao");
                 }
                 Some(_) => {
                     std::thread::sleep(Duration::from_secs(8));
@@ -307,18 +319,27 @@ fn handle_event(ev: &BthEvent, st: &mut GuardStats, state: &mut WatchState) -> b
                         .filter(|a| !pnp::bt_device_present(a))
                         .cloned()
                         .collect();
-                    if !missing.is_empty() && state.reconnect_grace.is_none() {
+                    if missing.is_empty() {
+                        // Tudo reconectou: zera o recuo e nao ha nada a fazer.
+                        state.repair_streak = 0;
+                        state.last_repair = None;
+                        state.reconnect_grace = None;
+                    } else if state.reconnect_grace.is_none() {
                         state.reconnect_grace = Some(Instant::now());
                         log("INFO", &format!("aguardando reconexao de {:?}", missing));
                     }
                 }
             }
         }
+        31 | 34 => {
+            // Informativos: sempre vem depois do 18 da mesma inicializacao.
+            log("INFO", &format!("evento BTHUSB id {} (informativo)", ev.id));
+        }
         3 => {
             st.hci_timeouts += 1;
             log("ERROR", "timeout de comando HCI (evento BTHUSB id 3)");
-            let _ = repair("timeout HCI");
-            st.recoveries += 1;
+            // O radio parou de responder: reiniciar o dongle resolve.
+            try_repair(st, state, "timeout HCI");
         }
         16 => {
             st.auth_failures += 1;
@@ -329,9 +350,76 @@ fn handle_event(ev: &BthEvent, st: &mut GuardStats, state: &mut WatchState) -> b
     true
 }
 
+/// Intervalo minimo entre reparos (cresce com o recuo exponencial).
+const REPAIR_MIN: Duration = Duration::from_secs(180);
+/// Teto do intervalo entre reparos.
+const REPAIR_MAX: Duration = Duration::from_secs(1800);
+/// Quantos reparos seguidos sao tolerados antes de so avisar.
+const REPAIR_STREAK_MAX: u32 = 6;
+
+/// Executa um reparo respeitando intervalo minimo e recuo exponencial.
+///
+/// Sem isso o vigia entra em laco: o radio reinicia -> o dispositivo (que
+/// pode estar despareado) nao volta -> o vigia reinicia o radio de novo...
+/// O recuo garante que o radio seja reiniciado no maximo uma vez a cada
+/// 3 minutos, com intervalo ate 30 minutos se as tentativas falharem.
+fn try_repair(st: &mut GuardStats, state: &mut WatchState, reason: &str) -> bool {
+    let now = Instant::now();
+    if let Some(t) = state.last_repair {
+        let wait = REPAIR_MIN
+            .saturating_mul(1u32 << state.repair_streak.min(5))
+            .min(REPAIR_MAX);
+        let elapsed = now.duration_since(t);
+        if elapsed < wait {
+            log(
+                "INFO",
+                &format!(
+                    "reparo adiado em {}s (espera minima {}s): {reason}",
+                    (wait - elapsed).as_secs(),
+                    wait.as_secs()
+                ),
+            );
+            return false;
+        }
+    }
+    if state.repair_streak >= REPAIR_STREAK_MAX {
+        log(
+            "WARN",
+            &format!(
+                "reparo nao executado ({} tentativas seguidas falharam): {reason}. \
+                 O dispositivo provavelmente precisa ser pareado de novo.",
+                state.repair_streak
+            ),
+        );
+        state.last_repair = Some(now);
+        return false;
+    }
+    state.repair_streak += 1;
+    state.last_repair = Some(now);
+    // O proprio reinicio gera os eventos 18/34/31: ignora-os por um tempo.
+    state.ignore_until = Some(now + Duration::from_secs(45));
+    state.reconnect_grace = None;
+    log(
+        "WARN",
+        &format!("reparo {} de {}: {reason}", state.repair_streak, REPAIR_STREAK_MAX),
+    );
+    let ok = repair(reason).unwrap_or(false);
+    if ok {
+        st.recoveries += 1;
+    }
+    ok
+}
+
 pub struct WatchState {
     pub last_epoch: u64,
     pub reconnect_grace: Option<Instant>,
+    /// Ultimo reparo executado (base do intervalo minimo).
+    pub last_repair: Option<Instant>,
+    /// Reparos seguidos sem sucesso (dirige o recuo exponencial).
+    pub repair_streak: u32,
+    /// Janela em que os eventos de reinicializacao sao ignorados: o proprio
+    /// reparo do vigia gera 18/34/31, e reagir a eles causaria laco.
+    pub ignore_until: Option<Instant>,
 }
 
 /// Contexto compartilhado entre o callback do EvtSubscribe e o laco principal.
@@ -495,6 +583,9 @@ pub fn watch() {
     let mut state = WatchState {
         last_epoch: 0,
         reconnect_grace: None,
+        last_repair: None,
+        repair_streak: 0,
+        ignore_until: None,
     };
     // Prioridade baixa: nao pode atrapalhar o sistema.
     unsafe {
@@ -601,6 +692,10 @@ pub fn watch() {
 }
 
 /// Verifica dispositivos que nao voltaram dentro da janela de graca.
+///
+/// Antes de reiniciar o radio, confirma que o proprio radio esta travado: se
+/// ele responde normalmente, o problema e do pareamento do dispositivo (que
+/// nenhum reinicio resolve) e nao vale a pena reiniciar o dongle em laco.
 fn check_grace(st: &mut GuardStats, state: &mut WatchState) {
     if let Some(t0) = state.reconnect_grace {
         if t0.elapsed() > Duration::from_secs(45) {
@@ -611,10 +706,23 @@ fn check_grace(st: &mut GuardStats, state: &mut WatchState) {
                 .filter(|a| !pnp::bt_device_present(a))
                 .cloned()
                 .collect();
-            if !missing.is_empty() {
-                log("WARN", &format!("reconexao falhou para {:?}", missing));
-                let _ = repair("dispositivo nao reconectou apos reset do radio");
-                st.recoveries += 1;
+            if missing.is_empty() {
+                state.repair_streak = 0;
+                state.last_repair = None;
+                return;
+            }
+            log("WARN", &format!("reconexao falhou para {:?}", missing));
+            if pnp::radio_healthy().is_none() {
+                try_repair(st, state, "radio travado apos reinicializacao");
+            } else {
+                // O radio esta saudavel: o dispositivo que nao voltou precisa
+                // ser re-pareado. Nao ha o que reiniciar.
+                log(
+                    "WARN",
+                    "radio responde normalmente; o dispositivo nao reconectou \
+                     (pareamento precisa ser refeito). Nenhum reparo tentado.",
+                );
+                state.repair_streak = state.repair_streak.saturating_sub(1);
             }
         }
     }
