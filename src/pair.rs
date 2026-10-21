@@ -351,11 +351,22 @@ pub fn service_state(addr: &str) -> Vec<(String, bool)> {
     );
     let mut out = Vec::new();
     for (name, guid) in AUDIO_SERVICES {
-        let enabled = reg::open_read(&format!("{base}\\{}", guid_str(&guid)))
+        // O Windows guarda o estado por INSTANCIA de servico: o valor
+        // "Enabled" fica nas subchaves C00000000 / C00000001, e nao direto
+        // na chave do GUID. (Ler no lugar errado dava "desligado" para tudo.)
+        let svc_key = format!("{base}\\{}", guid_str(&guid));
+        let enabled = reg::open_read(&svc_key)
             .ok()
-            .and_then(|k| reg::read_dword(&k, "Enabled").ok().flatten())
-            .map(|v| v != 0)
-            .unwrap_or(false);
+            .and_then(|k| reg::enum_subkeys(&k).ok())
+            .unwrap_or_default()
+            .iter()
+            .any(|inst| {
+                reg::open_read(&format!("{svc_key}\\{inst}"))
+                    .ok()
+                    .and_then(|k| reg::read_dword(&k, "Enabled").ok().flatten())
+                    .map(|v| v != 0)
+                    .unwrap_or(false)
+            });
         out.push((name.to_string(), enabled));
     }
     out
