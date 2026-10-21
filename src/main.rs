@@ -46,6 +46,7 @@ fn main() {
         "pair" => cmd_pair(),
         "unpair" => cmd_unpair(),
         "audio" => cmd_audio(),
+        "scan" => cmd_scan(),
         "watch" => cmd_watch(),
         "install" => {
             if elevated {
@@ -79,6 +80,8 @@ fn usage() {
          \x20 btguard recover     reinicia o radio agora\n\
          \x20 btguard pair [nome] emparelha um dispositivo (ex.: btguard pair h02d)\n\
          \x20 btguard unpair [end] remove o pareamento de um dispositivo\n\
+         \x20 btguard audio [end] religa os servicos de audio de um dispositivo\n\
+         \x20 btguard scan       varredura RF (mostra quem esta em modo pareamento)\n\
          \x20 btguard watch       vigilancia continua\n\
          \x20 btguard install     instala tudo (auto-elevacao)\n\
          \x20 btguard uninstall   remove tudo"
@@ -409,6 +412,44 @@ fn cmd_audio() -> i32 {
     println!("\nServicos (estado no registro):");
     for (name, on) in pair::service_state(&addr) {
         println!("  {} {name}", if on { "[ativo]" } else { "[----]" });
+    }
+    0
+}
+/// Varredura RF: mostra os dispositivos que estao anunciando presenca
+/// (ou seja, em modo pareamento). Diagnostico direto para a pergunta
+/// "o fone esta em modo pareamento?".
+fn cmd_scan() -> i32 {
+    let radios = pair::radios();
+    if radios.is_empty() {
+        eprintln!("Nenhum radio Bluetooth encontrado.");
+        return 1;
+    }
+    let radio = radios[0];
+    println!("Varredura RF (~10 s)...");
+    let found = pair::discover(radio, 8);
+    if found.is_empty() {
+        println!("Nenhum dispositivo respondeu.");
+        return 0;
+    }
+    for d in &found {
+        let tags = [
+            ("pareado", d.remembered),
+            ("conectado", d.connected),
+        ];
+        let marcas: Vec<&str> = tags
+            .iter()
+            .filter(|(_, v)| *v)
+            .map(|(k, _)| *k)
+            .collect();
+        let estado = if marcas.is_empty() {
+            "anunciando (modo pareamento)".to_string()
+        } else {
+            marcas.join(", ")
+        };
+        println!(
+            "  {}  {:<28} cod=0x{:08x}  {}",
+            d.addr, d.name, d.cod, estado
+        );
     }
     0
 }

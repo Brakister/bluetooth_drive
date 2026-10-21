@@ -36,7 +36,7 @@ Três fatos independentes, confirmados por evidência, formam a falha:
 | # | Fato | Evidência |
 |---|---|---|
 | A | O dongle entra em *selective suspend* USB e, ao acordar, **o firmware reinicia o controlador Bluetooth** | `DeviceSelectiveSuspended = 1`; `BTHUSB!FUN_14001882c` lê `SelectiveSuspendSupported`; sequência de ids 18/34/31 = "rádio inicializou" |
-| B | A chave de link do pareamento vive **só na RAM do dongle** | Evento `BTHUSB` id 18: *"O Windows não pode armazenar códigos de autenticação Bluetooth (chaves de link) no adaptador local"*; nenhum valor de chave de link em todo o registro |
+| B | A chave de link do pareamento é **volátil** (só existe na RAM do host; o dongle não a guarda e o registro também não) | Evento `BTHUSB` id 18: *"O Windows não pode armazenar códigos de autenticação Bluetooth (chaves de link) no adaptador local"*; varredura binária de todo o `BTHPORT` + `Control\Bluetooth`: **zero** valores de chave de link |
 | C | Cada reinício do rádio ⇒ **falha de autenticação mútua** ⇒ fone desconectado até reiniciar o PC | `BTHUSB` id 16: *"Falha na autenticação mútua ... (ee:e7:a9:aa:a8:af)"*, seguido de id 3 (*timeout* HCI) 60 s depois |
 
 O OBS era o gatilho mais frequente (e o mais visível), não a causa.
@@ -212,11 +212,27 @@ BTHUSB id 18 (Informativo):
 ```
 
 Tradução: **o Windows não consegue guardar a chave de link *no adaptador*.**
-Logo, a chave vive **na RAM do dongle**. Cada reinício do controlador ⇒ chave
-perdida ⇒ o fone tenta reconectar com a chave antiga ⇒ **id 16** (falha de
-autenticação mútua) ⇒ id 3 (timeout HCI) 60 s depois.
+Logo, a chave **não** vive no dongle. Cada reinício do controlador ⇒ o host
+perde a chave ⇒ o fone tenta reconectar com a chave antiga ⇒ **id 16** (falha
+de autenticação mútua) ⇒ id 3 (timeout HCI) 60 s depois.
 
-### 5.2 Varredura do registro
+### 5.2 Onde a chave de link realmente vive
+
+Três fontes de evidência, convergentes:
+
+| Onde? | Verificação | Resultado |
+|---|---|---|
+| **no dongle** | evento BTHUSB id 18 (o Windows não consegue gravar chaves no adaptador) | **não** — o rádio não tem onde guardar |
+| **no registro** | varredura binária de `HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT` (todos os dispositivos) + `Control\Bluetooth` | **não** — nenhum blob de 16 bytes; só o marcador `Store Link Key = 1` (ver [5.4](#54-store-link-key--o-que-ela-realmente-é)) |
+| **na RAM do host** | o par é revalidado a cada conexão; a chave só existe enquanto a pilha está viva | **sim** |
+
+Ou seja: **a chave de link é volátil**. Perde-se quando o rádio reinicia **ou
+quando o PC reinicia**. Este é o ponto central do problema: *"o Bluetooth só
+voltava depois de reiniciar o PC"* não era mágica do reboot — era o
+**re-pareamento** que o reboot forçava, e que hoje o BTGuard faz
+automaticamente.
+
+### 5.3 Varredura do registro (detalhe)
 
 Não existe **nenhuma** chave de link guardada pelo host:
 
@@ -232,7 +248,7 @@ Não existe **nenhuma** chave de link guardada pelo host:
 - `…\BTHPORT\Parameters\CachedServices\*`, `…\0\*` (instância do próprio rádio,
   `AssocBdAddr` = o fone) — sem chave de link.
 
-### 5.3 `Store Link Key` — o que ela **realmente** é
+### 5.4 `Store Link Key` — o que ela **realmente** é
 
 Engenharia reversa de `bthport.SYS`
 (sha256 `f0d8a8de34443467bfe54f724d2fbd591f3fbc260d13f43f2e87eb0ba7301673`).
@@ -356,11 +372,68 @@ apontar para o microfone da webcam (endpoint não-Bluetooth), em vez de
 `RestartOnFailure`, `ExecutionTimeLimit = 0`):
 
 - assinatura **push** do log `System` (`EvtSubscribe` + *callback* + `SetEvent`
-  + `WaitForSingleObject`) — sem *polling*;
-- ao ver id 18/34/31 (rádio reiniciou), 16 (auth falhou) ou 3 (timeout HCI):
-  espera, **reinicia só o devnode do dongle**, confere se o rádio voltou;
-- repete com espera crescente se não voltar;
+  + `WaitForSingleObject`) — sem *polling* do log;
+- **decide pela causa real, não pelo sintoma**:
+
+  | Situação | Ação |
+  |---|---|
+  | id 18 (rádio reiniciou) e o fone volta em ~12 s | nada |
+  | id 18 e o fone **não** volta, mas o rádio responde | **re-pareia** (a chave é volátil) |
+  | id 18 e o fone não volta e o rádio está **travado** | reinicia só o devnode do dongle |
+  | id 16 (falha de autenticação) e o fone não volta em 45 s | **re-pareia** |
+  | id 3 (timeout HCI) **logo após** um id 16 | nada (é consequência do pareamento velho) |
+  | id 3 isolado (rádio travado) | reinicia só o devnode do dongle |
+
+- **nunca entra em laço**: intervalo mínimo de 3 min entre reparos, recuo
+  exponencial até 30 min, teto de 6 tentativas seguidas, e uma janela em que os
+  eventos gerados pelo *próprio* reparo são ignorados;
 - log em `%ProgramData%\BTGuard\btguard.log` (com rotação).
+
+### 7.4 Pareamento via API do Windows (`src/pair.rs`)
+
+Re-parear pela interface do Windows (Settings) é lento e frágil. O BTGuard usa
+a mesma API que o Settings usa — `bluetoothapis.dll` +
+`bthprops.cpl` (`BluetoothFindFirstRadio`, `BluetoothFindFirstDevice` com
+`fIssueInquiry`, `BluetoothAuthenticateDevice`, `BluetoothSetServiceState`),
+sem automação de interface:
+
+| Comando | O que faz |
+|---|---|
+| `btguard pair [nome]` | varre em modo pareamento, emparelha com SSP (Just Works) e religa os serviços de áudio |
+| `btguard unpair [endereço]` | remove o pareamento |
+| `btguard audio [endereço]` | religa só os serviços de áudio (A2DP/HFP) de um dispositivo já pareado |
+
+**Armadilha real da API (encontrada e corrigida na implementação):**
+`BluetoothSetServiceState` com `dwServiceFlags = 0` significa **DESLIGAR** o
+serviço — *não* "consultar". A primeira versão do BTGuard usava isso como se
+fosse consulta e **desligava silenciosamente o A2DP e o HFP**; o fone caía em
+~3 s e parecia "desconectar sozinho". A correção:
+
+- `flags = 0x01` (`BLUETOOTH_SERVICE_ENABLE`) → habilita;
+- o estado real é lido do **registro** (`BTHPORT\Parameters\Devices\<addr>`),
+  porque o Windows não expõe consulta de serviço remoto pela API pública;
+- `ERROR_SERVICE_DOES_NOT_EXIST` (1060) = o fone não tem aquele perfil →
+  informativo; `ERROR_SERVICE_ALREADY_ENABLED` (87) = já estava ligado →
+  também informativo (não é erro).
+
+**Re-pareamento não destrutivo:** `pair::re_pair()` exporta a chave de registro
+do dispositivo (`reg.exe export`) antes de removê-la e **restaura o backup** se
+o pareamento falhar (por exemplo, o fone está desligado e não aparece na
+varredura). O vigia, assim, nunca destrói um pareamento que ainda pode
+servir.
+
+### 7.5 Detecção do "dispositivo esquecido"
+
+Estado pós-reboot (chave de link perdida): o registro ainda registra o
+dispositivo, mas a pilha Bluetooth já não o conhece. O vigia distingue:
+
+- dispositivo **conhecido e desconectado** → o fone está desligado → *não faz
+  nada*;
+- dispositivo **desconhecido da pilha** (e presente no registro) → o host
+  perdeu a chave → **re-pareia**.
+
+Essa verificação roda na largada do vigia (60 s após o start) e a cada
+janela de reconexão.
 
 ### 7.4 Nota sobre o registro da tarefa agendada
 
@@ -388,11 +461,39 @@ PowerShell (`New-ScheduledTaskTrigger -AtStartup` + `.Delay = 'PT30S'`,
 | Reinicializações espontâneas após o endurecimento | **nenhuma** (17:05 → 17:11 → horário posterior) |
 | `Store Link Key` | reescrito pela pilha ⇒ confirmado como marcador gerido pelo Windows |
 | Correção do OBS | aplicado; diff de 1 linha; backup criado |
+| **Re-pareamento via API** (17:21) | `BTHUSB id 10` (chave removida) às 17:21:11 → `BTHUSB id 8` (*vinculado com sucesso*) às 17:21:24; serviços **Audio Sink** (A2DP) e **Handsfree** (HFP) ativos |
+| **Re-conexão após reinício do rádio** | o fone volta **sozinho** em ~59 s (id 8) — sem reiniciar o PC |
+| **OBS aberto com o fone pareado** (17:24:29) | log do OBS: `WASAPI: Device 'Microfone (GENERAL WEBCAM)' initialized (source: Mic/Aux)`; **zero** eventos BTHUSB até 17:29 ⇒ o gatilho foi eliminado |
+| **Auto-re-pareamento** (simulação pós-reboot) | o vigia detecta o dispositivo sem chave, refaz o pareamento e religa o A2DP — sem reboot e sem ação do usuário |
 
-**Teste final pendente com o usuário:** re-parear o fone (o pareamento atual está
-quebrado desde 15:50:50) e então abrir o OBS e forçar um reinício do rádio
-(`btguard recover`) para confirmar que o fone volta **sozinho**, sem reiniciar
-o PC.
+### 8.1 Linha do tempo da sessão de reparo (21/10)
+
+```
+17:18:12  vigia instalado (tarefa agendada, SYSTEM)
+17:19:13  id 3 (timeout HCI) -> reinicio do radio -> "radio voltou a funcionar"
+17:19:15  id 34 (informativo) na sequencia do proprio reparo
+17:21:11  BTHUSB id 10   -> chave de link removida (despareamento proposital)
+17:21:24  BTHUSB id 8    -> vinculado com sucesso (re-pareamento via API do Windows)
+17:22:56  btguard recover -> reinicio do radio (teste)
+17:22:58  "radio voltou a funcionar"
+17:24:29  OBS aberto -> WASAPI inicializa o microfone da WEBCAM (gatilho eliminado)
+17:22:58 -> 17:29:xx   ZERO eventos BTHUSB (nenhum reinicio de radio ao abrir o OBS)
+17:30:18  BTHUSB id 10   -> chave removida (simulacao do estado pos-reboot)
+17:32:31  radio reiniciado -> id 18/34/31
+17:33:30  BTHUSB id 8    -> o fone reconectou sozinho (59 s), sem reiniciar o PC
+17:34:30  vigia novo build: janela de graca 45 s -> 90 s + recuperacao de largada
+```
+
+### 8.2 O que o teste do OBS provou
+
+Antes: `Mic/Aux` do OBS apontava para `"default"` → o Windows resolvia para o
+endpoint **HFP do fone** → o perfil do fone era trocado (A2DP → HFP) → o
+rádio acordava/reiniciava → a chave de link morria → o fone caía.
+
+Depois: `Mic/Aux` aponta para o microfone da webcam
+(`{0120b34b-…}`, `GENERAL WEBCAM`). O log do OBS de 17:24:29 mostra o
+endpoint sendo inicializado e **nenhum** evento BTHUSB foi emitido até 17:29 —
+o OBS parou de ser o gatilho.
 
 ---
 

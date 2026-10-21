@@ -47,10 +47,20 @@ verdade dormia: `DeviceSelectiveSuspended = 1` no registro do rádio.
 
 Quando o dongle dorme e acorda, o firmware do clone **reinicia o controlador
 Bluetooth**. Cada reinício dispara a sequência `BTHUSB` ids 18 → 34 → 31
-(= o rádio inicializou de novo) e — o que realmente importa — **apaga a chave
-de link**, que só existe na RAM do dongle (evento id 18: *"O Windows não pode
-armazenar códigos de autenticação Bluetooth (chaves de link) no adaptador
-local"*).
+(= o rádio inicializou de novo) e — o que realmente importa — **derruba a
+chave de link**.
+
+Onde a chave de link vive? Três fontes de evidência, todas convergem:
+
+| Onde? | Verificação | Resultado |
+|---|---|---|
+| **no dongle** | evento BTHUSB id 18: *"O Windows não pode armazenar códigos de autenticação Bluetooth (chaves de link) no adaptador local"* | **não** — o rádio não tem onde guardar |
+| **no registro** | varredura binária de todo `HKLM\...\Services\BTHPORT` + `Control\Bluetooth` (procura-se um blob de 16 bytes) | **não** — só existe o marcador `Store Link Key = 1` (ver [RE](RELATORIO-BT.md#re-de-bthportsys--store-link-key)) |
+| **na RAM do host** | o par é revalidado a cada conexão; a chave só existe enquanto o processo do Windows está vivo | **sim** |
+
+Ou seja: **a chave de link é volátil**. Perde-se quando o rádio reinicia ou
+quando o PC reinicia — e é por isso que o Bluetooth ficava morto até o
+reboot. Nada disso é culpa do OBS: o OBS só acordava o rádio.
 
 A partir daí o fone tenta reconectar e falha na autenticação mútua
 (**BTHUSB id 16**: *"Falha na autenticação mútua ... (ee:e7:a9:aa:a8:af)"*),
@@ -99,11 +109,33 @@ O `btguard watch` roda como `SYSTEM` (tarefa agendada `BTGuard`, disparada no
 boot +30 s, prioridade 7, `RestartOnFailure`) e:
 
 - assina o log `System` com **`EvtSubscribe` + callback** (push — sem polling);
-- quando aparece um evento `BTHUSB` de inicialização de rádio (ids 18/34/31)
-  ou de falha de autenticação (id 16) / *timeout* HCI (id 3), **reinicia apenas
-  o dongle** (`CM_Disable_DevNode` / `CM_Enable_DevNode`);
-- se o rádio não voltar, tenta de novo em intervalos crescentes;
+- quando o rádio reinicia (id 18), dá 12 s para o fone reconectar e, se ele não
+  voltar, decide o que fazer conforme a causa real:
+  - **rádio travado** (`radio_healthy() == None`) → **reinicia só o dongle**
+    (`CM_Disable_DevNode` / `CM_Enable_DevNode`);
+  - **pareamento velho** (houve falha de autenticação, id 16) → **refaz o
+    pareamento** (a chave de link é volátil: só o bonding devolve o fone);
+  - **fone simplesmente desligado** → não faz nada (ninguém reinicia nada);
+- **nunca entra em laço**: intervalo mínimo de 3 min entre reparos, recuo
+  exponencial até 30 min, teto de 6 tentativas seguidas, e uma janela em que os
+  eventos gerados pelo *próprio* reparo são ignorados;
 - tudo é registrado em `%ProgramData%\BTGuard\btguard.log`.
+
+### 4. Parear / re-parear sem tocar no Windows à mão
+
+`btguard pair` usa a API do Windows (`bluetoothapis.dll` + `bthprops.cpl` — o
+mesmo caminho do *Settings*), sem automação de interface:
+
+1. varre em modo pareamento (`BluetoothFindFirstDevice` com `fIssueInquiry`);
+2. emparelha com SSP (`BluetoothAuthenticateDevice`, *Just Works*);
+3. religa os serviços de áudio (`BluetoothSetServiceState`): **Audio Sink**
+   (A2DP) e **Handsfree** (HFP) — sem eles o fone fica pareado mas não aparece
+   como saída de áudio nem como microfone.
+
+> ⚠️ **Pegadinha da API:** `BluetoothSetServiceState` com `dwServiceFlags = 0`
+> significa **DESLIGAR** o serviço, não "consultar". Usar isso como se fosse
+> consulta desliga silenciosamente o A2DP/HFP e o fone cai em ~3 s. O
+> `btguard` lê o estado real no registro.
 
 ---
 
@@ -160,6 +192,10 @@ btguard diag        # diagnóstico completo (devices via Bluetooth API + variant
 btguard harden      # aplica o endurecimento (precisa de admin)
 btguard unharden    # reverte o endurecimento a partir do backup
 btguard recover     # reinicia o rádio agora (devolve o Bluetooth sem reiniciar o PC)
+btguard pair [nome] # emparelha um dispositivo (ex.: btguard pair h02d) — API do Windows
+btguard unpair [end]# remove o pareamento de um dispositivo
+btguard audio [end] # religa os serviços de áudio (A2DP/HFP) de um dispositivo pareado
+btguard scan        # varredura RF: mostra quem está anunciando presença (modo pareamento)
 btguard watch       # vigia contínua (é o que a tarefa agendada executa)
 btguard install     # instala (exe + endurecimento + tarefa)
 btguard uninstall   # remove a tarefa, reverte o registro e apaga o exe
@@ -177,8 +213,9 @@ BTGuard/
 ├─ Cargo.toml
 ├─ src/
 │  ├─ main.rs      # CLI, auto-elevação, install/uninstall, registro da tarefa
-│  ├─ guard.rs     # vigia push (EvtSubscribe + callback), reparo do rádio
+│  ├─ guard.rs     # vigia push (EvtSubscribe + callback), reparo do rádio, re-pareamento
 │  ├─ harden.rs    # endurecimento do driver (com backup/reversão)
+│  ├─ pair.rs      # pareamento via API do Windows (bluetoothapis/bthprops) e serviços de áudio
 │  ├─ pnp.rs       # descoberta do rádio (CM_Locate_DevNodeW) e dispositivos (Bluetooth API)
 │  ├─ reg.rs       # wrappers de registro (HKLM, DWORD, delete)
 │  └─ util.rs      # log com rotação, hora local, wide strings
@@ -211,16 +248,44 @@ falhar é que ele cai para um *polling* de 3 s.)
 
 ## Recuperação automática
 
-Quando o rádio trava, o vigia:
+O vigia decide a ação pela **causa real**, não pelo sintoma:
 
-1. detecta o evento (18/34/31 = rádio reiniciou, 16 = falha de autenticação,
-   3 = *timeout* HCI);
-2. espera alguns segundos para o caso de o rádio se recuperar sozinho;
-3. **reinicia só o dongle** (`CM_Disable_DevNode` → `CM_Enable_DevNode`);
-4. confirma que o rádio voltou (eventos de inicialização + dongle respondendo);
-5. se não voltou, tenta de novo (com espera crescente) e registra tudo no log.
+| Situação detectada | Ação | Porquê |
+|---|---|---|
+| Rádio reiniciou (id 18) e o fone volta em ~60 s | **nada** | foi só uma reinicialização |
+| Rádio reiniciou e **não volta** (id 3 = *timeout* HCI) | **reinicia só o dongle** | o rádio travou de verdade |
+| Rádio responde, mas o fone não volta e houve **id 16** | **refaz o pareamento** | a chave de link é volátil; só o bonding resolve |
+| Fone está no registro mas a pilha nem o conhece mais | **refaz o pareamento** | o host perdeu a chave (estado pós-reboot) |
+| Rádio responde, fone não volta, **sem** id 16 | **nada** | o fone está desligado/sem bateria |
+| Pareamento perdido de vez | id 10 (*chave removida*) | o vigia re-pareia no próximo ciclo |
 
-O pareamento com o fone é refeito pelo próprio host — **sem reiniciar o PC**.
+Em todos os caminhos: **sem reiniciar o PC**. O caso do re-pareamento exige
+apenas que o **fone esteja ligado**; se estiver desligado, o vigia tenta de
+novo mais tarde com espera crescente — e **nunca destrói** o pareamento
+antigo: o registro é exportado antes e restaurado se o re-pareamento falhar.
+
+### E depois de reiniciar o PC?
+
+A chave de link é **volátil** (ver [O que acontece](#o-que-acontece)): ela
+morre com o processo do Windows, não fica em disco. Então, depois de um
+reinício do PC, o fone precisa ser **pareado de novo** — mas o BTGuard faz
+isso sozinho:
+
+1. o rádio reinicializa no boot (id 18) e o fone falha a autenticação
+   (id 16) — os dois eventos acontecem **antes** da tarefa subir, então o vigia
+   os recupera numa leitura única do log na largada;
+2. 90 s depois, o vigia confere: o rádio está saudável e o fone não voltou →
+   o problema é a chave de link → **re-pareia** (varredura → SSP *Just Works*
+   → religa A2DP/HFP);
+3. o fone volta a funcionar sozinho. **Nenhuma ação do usuário, nenhum
+   reinício de PC.**
+
+Requisito: o fone precisa estar **ligado** e **descobrível** (modo pareamento).
+A maioria dos fones entra em modo pareamento sozinha depois de uma
+autenticação falha — e o `re_pair` do BTGuard varre o ar de qualquer forma.
+
+> Nota: se o fone estiver desligado no boot, o vigia espera — ele só age
+> quando o fone *anuncia* sua presença.
 
 ---
 

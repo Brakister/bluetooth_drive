@@ -359,6 +359,11 @@ fn handle_event(ev: &BthEvent, st: &mut GuardStats, state: &mut WatchState) -> b
             st.auth_failures += 1;
             state.last_auth_failure = Some(Instant::now());
             log("WARN", "falha de autenticacao mutua (evento BTHUSB id 16)");
+            // A chave de link esta velada: se o fone nao voltar, o vigia
+            // refaz o pareamento (re-iniciar o radio nao resolve).
+            if state.auth_grace.is_none() {
+                state.auth_grace = Some(Instant::now());
+            }
         }
         _ => {}
     }
@@ -371,6 +376,14 @@ const REPAIR_MIN: Duration = Duration::from_secs(180);
 const REPAIR_MAX: Duration = Duration::from_secs(1800);
 /// Quantos reparos seguidos sao tolerados antes de so avisar.
 const REPAIR_STREAK_MAX: u32 = 6;
+
+/// Janela de graca: quanto tempo o vigia espera o dispositivo voltar antes
+/// de agir.
+///
+/// Medido empiricamente neste hardware: depois de um reinicio do radio, o
+/// fone leva ~59 s para reconectar (id 8). Uma janela menor causava falsos
+/// positivos (o vigia decidia agir 1 s antes de o fone voltar).
+const GRACE: Duration = Duration::from_secs(90);
 
 /// Executa um reparo respeitando intervalo minimo e recuo exponencial.
 ///
@@ -476,6 +489,10 @@ pub struct WatchState {
     pub ignore_until: Option<Instant>,
     /// Ultima falha de autenticacao mutua (id 16): indica pareamento velho.
     pub last_auth_failure: Option<Instant>,
+    /// Janela de espera apos uma falha de autenticacao (id 16).
+    pub auth_grace: Option<Instant>,
+    /// Verificacao de largada (dispositivo lembrado mas desconhecido pela pilha).
+    pub startup_check: Option<Instant>,
 }
 
 /// Contexto compartilhado entre o callback do EvtSubscribe e o laco principal.
@@ -643,6 +660,8 @@ pub fn watch() {
         repair_streak: 0,
         ignore_until: None,
         last_auth_failure: None,
+        auth_grace: None,
+        startup_check: Some(Instant::now() + Duration::from_secs(60)),
     };
     // Prioridade baixa: nao pode atrapalhar o sistema.
     unsafe {
@@ -655,6 +674,11 @@ pub fn watch() {
     if let Some(e) = latest_bth_event() {
         state.last_epoch = e.epoch;
     }
+    // Recuperacao de largada: no boot o radio reinicializa e o fone falha a
+    // autenticacao (id 16) - mas isso acontece ANTES da tarefa agendada subir
+    // (boot +30 s). Sem esta leitura, o vigia nunca veria esses dois eventos e
+    // o fone ficaria sem chave de link e sem reparo.
+    catch_up_boot_events(&mut st, &mut state);
 
     unsafe {
         use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -748,14 +772,121 @@ pub fn watch() {
     }
 }
 
+/// Recupera do log os eventos BTHUSB que aconteceram pouco antes do vigia
+/// subir (leitura unica - nao e polling).
+///
+/// Cenario: no boot, o radio reinicializa (id 18) e o fone, ja ligado, falha
+/// a autenticacao mutua (id 16) porque o host perdeu a chave de link. A
+/// tarefa agendada so sobe 30 s depois do boot, entao a assinatura push
+/// (que comeca no bookmark mais recente) nunca veria esses dois eventos.
+fn catch_up_boot_events(st: &mut GuardStats, state: &mut WatchState) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut evs = recent_bth_events(32);
+    evs.reverse(); // cronologico
+    let mut radio_init = false;
+    let mut auth_fail = false;
+    for ev in evs {
+        if ev.epoch == 0 {
+            continue;
+        }
+        if now.saturating_sub(ev.epoch) > 300 {
+            continue; // so o que aconteceu nos ultimos 5 minutos
+        }
+        state.last_epoch = state.last_epoch.max(ev.epoch);
+        match ev.id {
+            18 => {
+                radio_init = true;
+                st.radio_restarts += 1;
+            }
+            16 => {
+                auth_fail = true;
+                st.auth_failures += 1;
+                state.last_auth_failure = Some(Instant::now());
+            }
+            _ => {}
+        }
+    }
+    if radio_init {
+        log(
+            "WARN",
+            "radio reinicializou antes do vigia subir (recuperado do log System)",
+        );
+        if state.reconnect_grace.is_none() {
+            state.reconnect_grace = Some(Instant::now());
+        }
+    }
+    if auth_fail {
+        log(
+            "WARN",
+            "falha de autenticacao antes do vigia subir (recuperada do log System)",
+        );
+        if state.auth_grace.is_none() {
+            state.auth_grace = Some(Instant::now());
+        }
+    }
+}
+
 /// Verifica dispositivos que nao voltaram dentro da janela de graca.
 ///
 /// Antes de reiniciar o radio, confirma que o proprio radio esta travado: se
 /// ele responde normalmente, o problema e do pareamento do dispositivo (que
 /// nenhum reinicio resolve) e nao vale a pena reiniciar o dongle em laco.
 fn check_grace(st: &mut GuardStats, state: &mut WatchState) {
+    // Verificacao de largada: logo depois do boot o host pode ter perdido a
+    // chave de link (ela e volatil). Se a pilha nao conhece mais um dispositivo
+    // que o registro ainda recorda, o pareamento precisa ser refeito.
+    if let Some(t) = state.startup_check {
+        if Instant::now() >= t {
+            state.startup_check = None;
+            let esquecidos = crate::pair::forgotten_devices();
+            if !esquecidos.is_empty() {
+                log(
+                    "WARN",
+                    &format!(
+                        "dispositivo(s) lembrado(s) mas desconhecido(s) pela pilha: {:?}",
+                        esquecidos
+                    ),
+                );
+                state.reconnect_grace = Some(Instant::now());
+            }
+        }
+    }
+
+    // Falha de autenticacao: o fone nao voltou depois do erro de chave.
+    if let Some(t0) = state.auth_grace {
+        if t0.elapsed() > GRACE {
+            state.auth_grace = None;
+            let expected = expected_devices();
+            let missing: Vec<String> = expected
+                .iter()
+                .filter(|a| !pnp::bt_device_present(a))
+                .cloned()
+                .collect();
+            if missing.is_empty() {
+                state.repair_streak = 0;
+                state.last_repair = None;
+                return;
+            }
+            log(
+                "WARN",
+                &format!(
+                    "falha de autenticacao e o dispositivo nao reconectou: {:?}",
+                    missing
+                ),
+            );
+            if pnp::radio_healthy().is_none() {
+                try_repair(st, state, "radio travado apos falha de autenticacao");
+            } else {
+                try_re_pair(st, state, &missing[0]);
+            }
+        }
+    }
+
     if let Some(t0) = state.reconnect_grace {
-        if t0.elapsed() > Duration::from_secs(45) {
+        if t0.elapsed() > GRACE {
             state.reconnect_grace = None;
             let expected = expected_devices();
             let missing: Vec<String> = expected
@@ -771,33 +902,43 @@ fn check_grace(st: &mut GuardStats, state: &mut WatchState) {
             log("WARN", &format!("reconexao falhou para {:?}", missing));
             if pnp::radio_healthy().is_none() {
                 try_repair(st, state, "radio travado apos reinicializacao");
-            } else if let Some(t) = state.last_auth_failure {
-                // Houve falha de autenticacao: o pareamento esta velho (a chave
-                // de link vive so na RAM). Nao adianta reiniciar o radio:
-                // o que resolve e refazer o pareamento.
-                if t.elapsed() < Duration::from_secs(600) {
+                return;
+            }
+            // O radio esta saudavel: o problema e o pareamento, nao o radio.
+            //  (a) o dispositivo nem aparece mais na pilha -> o host perdeu a
+            //      chave de link (estado pos-reboot);
+            //  (b) houve falha de autenticacao (id 16) -> chave vencida.
+            let esquecidos = crate::pair::forgotten_devices();
+            let alvo = missing
+                .iter()
+                .find(|a| esquecidos.iter().any(|e| e.eq_ignore_ascii_case(a)))
+                .cloned()
+                .or_else(|| {
+                    let auth = state
+                        .last_auth_failure
+                        .map(|t| t.elapsed() < Duration::from_secs(600))
+                        .unwrap_or(false);
+                    if auth {
+                        missing.first().cloned()
+                    } else {
+                        None
+                    }
+                });
+            match alvo {
+                Some(addr) => {
                     log(
                         "WARN",
-                        "pareamento invalido (falha de autenticacao): tentando re-parear",
+                        &format!("pareamento invalido ({addr}): refazendo o pareamento"),
                     );
-                    try_re_pair(st, state, &missing[0]);
-                } else {
+                    try_re_pair(st, state, &addr);
+                }
+                None => {
                     log(
                         "INFO",
-                        "dispositivo nao conectou, mas o radio esta saudavel e nao ha \
-                         falha de autenticacao recente (provavelmente o fone esta \
-                         desligado). Nada a fazer.",
+                        "radio saudavel e sem falha de autenticacao: o fone \
+                         provavelmente esta desligado. Nada a fazer.",
                     );
                 }
-            } else {
-                // O radio esta saudavel: o dispositivo que nao voltou precisa
-                // ser re-pareado. Nao ha o que reiniciar.
-                log(
-                    "WARN",
-                    "radio responde normalmente; o dispositivo nao reconectou \
-                     (pareamento precisa ser refeito). Nenhum reparo tentado.",
-                );
-                state.repair_streak = state.repair_streak.saturating_sub(1);
             }
         }
     }

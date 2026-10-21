@@ -221,6 +221,35 @@ pub fn enable_services(radio: HANDLE, addr: &str) -> Vec<(String, Result<(), u32
     }
 }
 
+/// Exporta a chave de registro do dispositivo para um .reg (backup).
+///
+/// O re-pareamento remove o registro do dispositivo. Se o pareamento falhar
+/// (por exemplo, o fone esta desligado), o registro e restaurado para nao
+/// perder o pareamento antigo.
+fn backup_registry(addr: &str) -> Option<std::path::PathBuf> {
+    let key = format!(r"{}\{}", crate::pnp::BTHPORT_DEVICES_KEY, addr.to_lowercase());
+    let path = std::env::temp_dir().join(format!("btguard-dev-{addr}.reg"));
+    let ok = std::process::Command::new("reg.exe")
+        .args(["export", &key, &path.to_string_lossy(), "/y"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Restaura o backup do registro do dispositivo.
+fn restore_registry(path: &std::path::Path) -> bool {
+    std::process::Command::new("reg.exe")
+        .args(["import", &path.to_string_lossy()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Re-pareia um dispositivo ja conhecido.
 ///
 /// Usado pelo vigia quando o pareamento fica "velho": o host guarda a chave
@@ -229,37 +258,80 @@ pub fn enable_services(radio: HANDLE, addr: &str) -> Vec<(String, Result<(), u32
 /// corrupcao faz o pareamento virar "lembrado mas sem chave" e a
 /// autenticacao falha (BTHUSB id 16) ate o dispositivo ser pareado de novo.
 ///
-/// Sequencia: remove o registro quebrado -> procura o dispositivo em modo
-/// pareamento -> emparelha -> religa os servicos de audio.
+/// Sequencia: backup do registro -> remove o registro quebrado -> procura o
+/// dispositivo em modo pareamento -> emparelha -> religa os servicos de audio.
+/// Se o pareamento falhar, o registro antigo e restaurado.
 pub fn re_pair(addr: &str, timeout_s: u64) -> Result<(), String> {
     let radios = radios();
     let radio = *radios.first().ok_or("nenhum radio Bluetooth")?;
 
+    let backup = backup_registry(addr);
     log("INFO", &format!("re-pareando {addr}: limpando o pareamento antigo"));
     let _ = remove(addr);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_s);
-    loop {
+    let mut alvo = None;
+    while alvo.is_none() {
         for d in discover(radio, 4) {
-            let alvo = d.addr.eq_ignore_ascii_case(addr);
-            if alvo {
-                log("INFO", &format!("pareando {} ({})", d.name, d.addr));
-                authenticate(radio, &d.addr)?;
-                for (name, r) in enable_services(radio, &d.addr) {
-                    match r {
-                        Ok(()) => log("INFO", &format!("servico ativado: {name}")),
-                        Err(c) => log("INFO", &format!("servico indisponivel: {name} ({c})")),
-                    }
-                }
-                log("INFO", &format!("re-pareamento de {addr} concluido"));
-                return Ok(());
+            if d.addr.eq_ignore_ascii_case(addr) {
+                alvo = Some(d);
+                break;
             }
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!("{addr} nao apareceu na varredura de pareamento"));
+        if alvo.is_none() {
+            if std::time::Instant::now() >= deadline {
+                // Nao achou o fone (provavelmente desligado): restaura o
+                // registro para nao perder o pareamento antigo.
+                if let Some(p) = &backup {
+                    if restore_registry(p) {
+                        log(
+                            "INFO",
+                            "fone nao apareceu no pareamento; registro antigo restaurado",
+                        );
+                    }
+                }
+                return Err(format!("{addr} nao apareceu na varredura de pareamento"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(700));
         }
-        std::thread::sleep(std::time::Duration::from_millis(700));
     }
+
+    let d = alvo.unwrap();
+    log("INFO", &format!("pareando {} ({})", d.name, d.addr));
+    match authenticate(radio, &d.addr) {
+        Ok(()) => {}
+        Err(e) => {
+            if let Some(p) = &backup {
+                let _ = restore_registry(p);
+            }
+            return Err(e);
+        }
+    }
+    for (name, r) in enable_services(radio, &d.addr) {
+        match r {
+            Ok(()) => log("INFO", &format!("servico ativado: {name}")),
+            Err(c) => log("INFO", &format!("servico indisponivel: {name} ({c})")),
+        }
+    }
+    let _ = std::fs::remove_file(backup.unwrap_or_default());
+    log("INFO", &format!("re-pareamento de {addr} concluido"));
+    Ok(())
+}
+
+/// Dispositivos que o Windows ate conhece (pareados), mas que a pilha
+/// Bluetooth ainda nao listingou (nem conectados, nem lembrados).
+///
+/// Sinal tipico de "o host esqueceu a chave de link": o registro ainda tem o
+/// dispositivo, mas a pilha nao consegue mais autenticar com ele.
+pub fn forgotten_devices() -> Vec<String> {
+    let known = crate::pnp::bt_devices();
+    let mut out = Vec::new();
+    for (addr, _name) in crate::pnp::paired_devices() {
+        if !known.iter().any(|d| d.addr.eq_ignore_ascii_case(&addr)) {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 /// Estado (servicos habilitados) do dispositivo.
