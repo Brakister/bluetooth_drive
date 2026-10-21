@@ -338,11 +338,26 @@ fn handle_event(ev: &BthEvent, st: &mut GuardStats, state: &mut WatchState) -> b
         3 => {
             st.hci_timeouts += 1;
             log("ERROR", "timeout de comando HCI (evento BTHUSB id 3)");
+            // Se houve falha de autenticacao nos ultimos 2 minutos, o timeout
+            // e consequencia do pareamento quebrado (o host nao consegue
+            // autenticar e a pilha fica esperando) e nao do radio travado.
+            // Reiniciar o radio nao resolveria: so gastaria energia.
+            if let Some(t) = state.last_auth_failure {
+                if t.elapsed() < Duration::from_secs(120) {
+                    log(
+                        "INFO",
+                        "timeout HCI: consequencia da falha de autenticacao; \
+                         o radio precisa de re-pareamento, nao de reinicio",
+                    );
+                    return true;
+                }
+            }
             // O radio parou de responder: reiniciar o dongle resolve.
             try_repair(st, state, "timeout HCI");
         }
         16 => {
             st.auth_failures += 1;
+            state.last_auth_failure = Some(Instant::now());
             log("WARN", "falha de autenticacao mutua (evento BTHUSB id 16)");
         }
         _ => {}
@@ -410,6 +425,45 @@ fn try_repair(st: &mut GuardStats, state: &mut WatchState, reason: &str) -> bool
     ok
 }
 
+/// Refaz o pareamento de um dispositivo, respeitando o mesmo intervalo minimo
+/// e recuo exponencial dos reparos de radio.
+///
+/// Reiniciar o radio NAO resolve um pareamento velho: a chave de link vive
+/// apenas na RAM do host (nao ha valor de chave de link em nenhum lugar do
+/// registro - ver RELATORIO-BT.md), entao e preciso refazer o bonding.
+fn try_re_pair(st: &mut GuardStats, state: &mut WatchState, addr: &str) -> bool {
+    let now = Instant::now();
+    if let Some(t) = state.last_repair {
+        let wait = REPAIR_MIN
+            .saturating_mul(1u32 << state.repair_streak.min(5))
+            .min(REPAIR_MAX);
+        let elapsed = now.duration_since(t);
+        if elapsed < wait {
+            log(
+                "INFO",
+                &format!("re-pareamento adiado em {}s", (wait - elapsed).as_secs()),
+            );
+            return false;
+        }
+    }
+    state.repair_streak += 1;
+    state.last_repair = Some(now);
+    state.ignore_until = Some(now + Duration::from_secs(45));
+    log("WARN", &format!("re-pareando {addr}"));
+    match crate::pair::re_pair(addr, 25) {
+        Ok(()) => {
+            state.repair_streak = 0;
+            state.last_repair = None;
+            st.recoveries += 1;
+            true
+        }
+        Err(e) => {
+            log("WARN", &format!("re-pareamento de {addr} falhou: {e}"));
+            false
+        }
+    }
+}
+
 pub struct WatchState {
     pub last_epoch: u64,
     pub reconnect_grace: Option<Instant>,
@@ -420,6 +474,8 @@ pub struct WatchState {
     /// Janela em que os eventos de reinicializacao sao ignorados: o proprio
     /// reparo do vigia gera 18/34/31, e reagir a eles causaria laco.
     pub ignore_until: Option<Instant>,
+    /// Ultima falha de autenticacao mutua (id 16): indica pareamento velho.
+    pub last_auth_failure: Option<Instant>,
 }
 
 /// Contexto compartilhado entre o callback do EvtSubscribe e o laco principal.
@@ -586,6 +642,7 @@ pub fn watch() {
         last_repair: None,
         repair_streak: 0,
         ignore_until: None,
+        last_auth_failure: None,
     };
     // Prioridade baixa: nao pode atrapalhar o sistema.
     unsafe {
@@ -714,6 +771,24 @@ fn check_grace(st: &mut GuardStats, state: &mut WatchState) {
             log("WARN", &format!("reconexao falhou para {:?}", missing));
             if pnp::radio_healthy().is_none() {
                 try_repair(st, state, "radio travado apos reinicializacao");
+            } else if let Some(t) = state.last_auth_failure {
+                // Houve falha de autenticacao: o pareamento esta velho (a chave
+                // de link vive so na RAM). Nao adianta reiniciar o radio:
+                // o que resolve e refazer o pareamento.
+                if t.elapsed() < Duration::from_secs(600) {
+                    log(
+                        "WARN",
+                        "pareamento invalido (falha de autenticacao): tentando re-parear",
+                    );
+                    try_re_pair(st, state, &missing[0]);
+                } else {
+                    log(
+                        "INFO",
+                        "dispositivo nao conectou, mas o radio esta saudavel e nao ha \
+                         falha de autenticacao recente (provavelmente o fone esta \
+                         desligado). Nada a fazer.",
+                    );
+                }
             } else {
                 // O radio esta saudavel: o dispositivo que nao voltou precisa
                 // ser re-pareado. Nao ha o que reiniciar.

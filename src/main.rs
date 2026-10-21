@@ -11,6 +11,7 @@
 
 mod guard;
 mod harden;
+mod pair;
 mod pnp;
 mod reg;
 mod util;
@@ -42,6 +43,9 @@ fn main() {
             }
         }
         "recover" => cmd_recover(),
+        "pair" => cmd_pair(),
+        "unpair" => cmd_unpair(),
+        "audio" => cmd_audio(),
         "watch" => cmd_watch(),
         "install" => {
             if elevated {
@@ -73,6 +77,8 @@ fn usage() {
          \x20 btguard harden      aplica o endurecimento (requer administrador)\n\
          \x20 btguard unharden    reverte o endurecimento\n\
          \x20 btguard recover     reinicia o radio agora\n\
+         \x20 btguard pair [nome] emparelha um dispositivo (ex.: btguard pair h02d)\n\
+         \x20 btguard unpair [end] remove o pareamento de um dispositivo\n\
          \x20 btguard watch       vigilancia continua\n\
          \x20 btguard install     instala tudo (auto-elevacao)\n\
          \x20 btguard uninstall   remove tudo"
@@ -254,6 +260,179 @@ fn cmd_recover() -> i32 {
 
 fn cmd_watch() -> i32 {
     guard::watch();
+    0
+}
+
+/// Emparelha um dispositivo Bluetooth.
+///
+/// Fluxo:
+///   1) (opcional) remove o pareamento antigo, quebrado;
+///   2) faz varredura RF ate encontrar o dispositivo em modo pareamento;
+///   3) pareia via BluetoothAuthenticateDevice (o Windows mostra o popup);
+///   4) habilita os servicos de audio (A2DP/HFP).
+fn cmd_pair() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    // Alvos: argumento posicional + o endereco conhecido do fone H02D.
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(a) = args.get(2) {
+        if !a.starts_with("--") {
+            targets.push(a.to_lowercase());
+        }
+    }
+    if targets.is_empty() {
+        targets.push("h02d".to_string());
+    }
+    let keep = args.iter().any(|a| a == "--keep");
+    let secs: u64 = args
+        .iter()
+        .position(|a| a == "--timeout")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
+    let radios = pair::radios();
+    if radios.is_empty() {
+        eprintln!("Nenhum radio Bluetooth encontrado (o dongle esta plugged in?).");
+        return 1;
+    }
+    let radio = radios[0];
+    println!("Radios Bluetooth: {}", radios.len());
+
+    // 1) Limpa o pareamento antigo (a chave de link quebrada).
+    if !keep {
+        for (addr, _name) in pnp::paired_devices() {
+            let addr_l = addr.to_lowercase();
+            let hit = targets.iter().any(|t| {
+                (t.len() == 12 && t.chars().all(|c| c.is_ascii_hexdigit()) && addr_l == *t)
+                    || addr_l.contains(t)
+                    || targets.iter().any(|x| x == "h02d") && addr_l == "eee7a9aaa8af"
+            });
+            if hit {
+                println!("Removendo pareamento antigo de {addr}...");
+                match pair::remove(&addr) {
+                    Ok(()) => println!("  removido."),
+                    Err(e) => println!("  nao foi possivel remover: {e}"),
+                }
+            }
+        }
+    }
+
+    // 2) Varredura RF ate encontrar o alvo.
+    println!("Procurando em modo pareamento ({secs}s). Ligue o fone e aperte o botao ate piscar azul rapido.");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut hit: Option<pair::Found> = None;
+    let mut seen: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline && hit.is_none() {
+        for d in pair::discover(radio, 4) {
+            let tag = format!(
+                "{} {} cod=0x{:08x} conectado={} lembrado={}",
+                d.addr, d.name, d.cod, d.connected, d.remembered
+            );
+            if !seen.contains(&tag) {
+                seen.push(tag.clone());
+                println!("  visto: {tag}");
+            }
+            let n = d.name.to_lowercase();
+            if targets
+                .iter()
+                .any(|t| n.contains(t) || (t.len() == 12 && d.addr.eq_ignore_ascii_case(t)))
+            {
+                hit = Some(d);
+                break;
+            }
+        }
+        if hit.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+    }
+
+    let Some(d) = hit else {
+        eprintln!("Nao encontrei nenhum dispositivo em modo pareamento.");
+        eprintln!("Verifique: fone ligado, botao de pareamento pressionado ate piscar azul rapido.");
+        return 2;
+    };
+    println!("Encontrado: {} ({})", d.name, d.addr);
+
+    // 3) Pareamento SSP.
+    println!("Executando o pareamento (confirme o popup do Windows, se aparecer)...");
+    match pair::authenticate(radio, &d.addr) {
+        Ok(()) => println!("Pareamento concluido."),
+        Err(e) => {
+            eprintln!("Falha no pareamento: {e}");
+            eprintln!("Se o popup nao apareceu, tente o caminho manual:");
+            eprintln!("  Configuracoes > Bluetooth e dispositivos > Adicionar dispositivo");
+            return 1;
+        }
+    }
+
+    // 4) Servicos de audio.
+    println!("Habilitando servicos de audio...");
+    for (name, r) in pair::enable_services(radio, &d.addr) {
+        match r {
+            Ok(()) => println!("  [ok]   {name}"),
+            Err(code) => println!("  [--]   {name} (codigo {code})"),
+        }
+    }
+    println!("\nDispositivo: {} ({})", d.name, d.addr);
+    println!("Servicos (estado no registro):");
+    for (name, on) in pair::service_state(&d.addr) {
+        println!("  {} {name}", if on { "[ativo]" } else { "[----]" });
+    }
+    0
+}
+
+/// Habilita (ou reabilita) os servicos de audio de um dispositivo ja
+/// pareado. Util quando o A2DP/HFP caem sozinhos: nao refaz o pareamento,
+/// so religa os servicos que o Windows desligou.
+fn cmd_audio() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    let addr = args
+        .get(2)
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "eee7a9aaa8af".to_string());
+    let radios = pair::radios();
+    if radios.is_empty() {
+        eprintln!("Nenhum radio Bluetooth encontrado.");
+        return 1;
+    }
+    let radio = radios[0];
+    println!("Habilitando servicos de audio de {addr}...");
+    for (name, r) in pair::enable_services(radio, &addr) {
+        match r {
+            Ok(()) => println!("  [ok]   {name}"),
+            // 1060 = ERROR_SERVICE_DOES_NOT_EXIST: o fone nao expoe esse
+            // servico, o que e normal.
+            Err(1060) => println!("  [--]   {name} (fone nao expoe este servico)"),
+            Err(code) => println!("  [ERRO] {name} (codigo {code})"),
+        }
+    }
+    println!("\nServicos (estado no registro):");
+    for (name, on) in pair::service_state(&addr) {
+        println!("  {} {name}", if on { "[ativo]" } else { "[----]" });
+    }
+    0
+}
+/// Remove o pareamento de um dispositivo.
+fn cmd_unpair() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    let target = args.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
+    let mut any = false;
+    for (addr, name) in pnp::paired_devices() {
+        let hit = target.is_empty()
+            || addr.to_lowercase() == target
+            || name.to_lowercase().contains(&target);
+        if hit {
+            any = true;
+            match pair::remove(&addr) {
+                Ok(()) => println!("Pareamento removido: {addr} {name}"),
+                Err(e) => println!("Falha ao remover {addr}: {e}"),
+            }
+        }
+    }
+    if !any {
+        eprintln!("Nenhum dispositivo pareado corresponde a '{target}'.");
+        return 1;
+    }
     0
 }
 
