@@ -204,6 +204,17 @@ btguard uninstall   # remove a tarefa, reverte o registro e apaga o exe
 Os comandos que tocam no registro ou no rádio pedem elevação automaticamente
 (`Start-Process -Verb RunAs`).
 
+### Verificar se a recuperação automática funcionou
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install\Test-Recuperacao.ps1
+```
+
+Mostra um veredito por item (vigia no ar, tarefa registrada, fone conectado,
+fone autenticado, endurecimento aplicado, reinícios espontâneos do rádio) e o
+trecho relevante do log. **É este comando que deve rodar depois de um
+reinício do PC**, para conferir que o fone voltou sozinho.
+
 ---
 
 ## Arquivos
@@ -222,7 +233,8 @@ BTGuard/
 ├─ install/
 │  ├─ Install-BTGuard.ps1   # instalador (auto-elevação, build, OBS, tarefa)
 │  ├─ Uninstall-BTGuard.ps1 # desinstalador (reverte registro e OBS)
-│  └─ Fix-OBSAudio.ps1      # corrige a captura de áudio do OBS
+│  ├─ Fix-OBSAudio.ps1      # corrige a captura de áudio do OBS
+│  └─ Test-Recuperacao.ps1  # verifica se a recuperação automática funcionou
 ├─ README.md
 └─ RELATORIO-BT.md
 ```
